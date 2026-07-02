@@ -1,0 +1,103 @@
+diff --git a/src/cmd/link/internal/ld/data.go b/src/cmd/link/internal/ld/data.go
+index 5b6dabb..7df954a 100644
+--- a/src/cmd/link/internal/ld/data.go
++++ b/src/cmd/link/internal/ld/data.go
+@@ -59,6 +59,58 @@ func isRuntimeDepPkg(pkg string) bool {
+ 	return objabi.LookupPkgSpecial(pkg).Runtime
+ }
+ 
++func movableTextStart(ldr *loader.Loader, textp []loader.Sym) int {
++	i := 0
++	// don't move the buildid symbol
++	if len(textp) > 0 && ldr.SymName(textp[0]) == "go:buildid" {
++		i++
++	}
++	// Skip over C symbols, as functions in a (C object) section must stay together.
++	// TODO: maybe we can move a section as a whole.
++	// Note: we load C symbols before Go symbols, so we can scan from the start.
++	for i < len(textp) && (ldr.SubSym(textp[i]) != 0 || ldr.AttrSubSymbol(textp[i])) {
++		i++
++	}
++	return i
++}
++
++func applyTextOrder(ctxt *Link, orderFile string) {
++	if orderFile == "" {
++		return
++	}
++	data, err := os.ReadFile(orderFile)
++	if err != nil {
++		Exitf("read text order %s: %v", orderFile, err)
++	}
++	order := make(map[string]int)
++	for _, line := range strings.Split(string(data), "\n") {
++		line = strings.TrimSpace(line)
++		if line == "" || strings.HasPrefix(line, "#") {
++			continue
++		}
++		if _, exists := order[line]; !exists {
++			order[line] = len(order)
++		}
++	}
++	if len(order) == 0 {
++		return
++	}
++
++	ldr := ctxt.loader
++	textp := ctxt.Textp[movableTextStart(ldr, ctxt.Textp):]
++	sort.SliceStable(textp, func(i, j int) bool {
++		ri, iok := order[ldr.SymName(textp[i])]
++		rj, jok := order[ldr.SymName(textp[j])]
++		if iok != jok {
++			return iok
++		}
++		if iok {
++			return ri < rj
++		}
++		return false
++	})
++}
++
+ // Estimate the max size needed to hold any new trampolines created for this function. This
+ // is used to determine when the section can be split if it becomes too large, to ensure that
+ // the trampolines are in the same section as the function that uses them.
+@@ -2530,24 +2582,14 @@ func (ctxt *Link) textaddress() {
+ 
+ 	if *flagRandLayout != 0 {
+ 		r := rand.New(rand.NewSource(*flagRandLayout))
+-		textp := ctxt.Textp
+-		i := 0
+-		// don't move the buildid symbol
+-		if len(textp) > 0 && ldr.SymName(textp[0]) == "go:buildid" {
+-			i++
+-		}
+-		// Skip over C symbols, as functions in a (C object) section must stay together.
+-		// TODO: maybe we can move a section as a whole.
+-		// Note: we load C symbols before Go symbols, so we can scan from the start.
+-		for i < len(textp) && (ldr.SubSym(textp[i]) != 0 || ldr.AttrSubSymbol(textp[i])) {
+-			i++
+-		}
+-		textp = textp[i:]
++		textp := ctxt.Textp[movableTextStart(ldr, ctxt.Textp):]
+ 		r.Shuffle(len(textp), func(i, j int) {
+ 			textp[i], textp[j] = textp[j], textp[i]
+ 		})
+ 	}
+ 
++	applyTextOrder(ctxt, *flagTextOrder)
++
+ 	// Sort the text symbols by type, so that FIPS symbols are
+ 	// gathered together, with the FIPS start and end symbols
+ 	// bracketing them , even if we've randomized the overall order.
+diff --git a/src/cmd/link/internal/ld/main.go b/src/cmd/link/internal/ld/main.go
+index a4b3a04..9789336 100644
+--- a/src/cmd/link/internal/ld/main.go
++++ b/src/cmd/link/internal/ld/main.go
+@@ -110,6 +110,7 @@ var (
+ 	flagEntrySymbol   = flag.String("E", "", "set `entry` symbol name")
+ 	flagPruneWeakMap  = flag.Bool("pruneweakmap", true, "prune weak mapinit refs")
+ 	flagRandLayout    = flag.Int64("randlayout", 0, "randomize function layout")
++	flagTextOrder     = flag.String("textorder", "", "read text symbol layout order from `file`")
+ 	flagAllErrors     = flag.Bool("e", false, "no limit on number of errors reported")
+ 	cpuprofile        = flag.String("cpuprofile", "", "write cpu profile to `file`")
+ 	memprofile        = flag.String("memprofile", "", "write memory profile to `file`")

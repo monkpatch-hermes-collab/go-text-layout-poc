@@ -1,0 +1,11 @@
+bin/
+bin126/
+cmd/interleaved/
+cmd/grouped/
+hot.order
+*.metrics.txt
+*.go126.metrics.txt
+/pprof2textorder
+*.test
+*.prof
+*.pprof
