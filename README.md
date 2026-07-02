@@ -139,9 +139,29 @@ Convert a CPU profile into a text order file:
   -profile cpu.pprof \
   -binary ./app.base \
   -mode flat \
+  -stats \
   -unmatched unmatched.txt \
   > hot.order
 ```
+
+For Teleport, `teleport debug profile` usually writes the CPU profile as `profile.pprof`, not `cpu.pprof`:
+
+```bash
+./pprof2textorder \
+  -profile ./profile.pprof \
+  -binary "$(which teleport)" \
+  -mode flat \
+  -stats \
+  -unmatched unmatched.txt \
+  > teleport.hot.order
+```
+
+If stdout is empty, the tool now prints conversion stats to stderr. Common causes:
+
+- `samples: 0` — the CPU profile was collected while the process was idle or for too short a duration.
+- `dropped_runtime` equals `functions_seen` — the profile only hit Go runtime/internal functions; retry with `-keep-runtime` to inspect, or collect under real workload.
+- `samples_without_function_name` is high — inspect the file with `go tool pprof`; make sure this is the CPU `profile.pprof`, not heap/goroutine.
+- `dropped_unmatched` is high when `-binary` is used — pass the exact binary that produced the profile and inspect `-unmatched unmatched.txt`.
 
 Modes:
 

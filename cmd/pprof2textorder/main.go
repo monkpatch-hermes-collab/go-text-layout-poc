@@ -19,12 +19,24 @@ type entry struct {
 	Weight int64
 }
 
+type stats struct {
+	Samples          int
+	SamplesZero      int
+	SamplesNoName    int
+	FunctionsSeen    int
+	DroppedMinWeight int
+	DroppedRuntime   int
+	DroppedUnmatched int
+	Emitted          int
+}
+
 func main() {
 	profilePath := flag.String("profile", "", "CPU pprof profile to read")
 	binaryPath := flag.String("binary", "", "optional binary used to filter names to real text symbols via `go tool nm`")
 	mode := flag.String("mode", "flat", "hotness mode: flat or cum")
 	minWeight := flag.Int64("min-weight", 1, "minimum accumulated sample weight to emit")
 	keepRuntime := flag.Bool("keep-runtime", false, "include runtime/internal symbols")
+	showStats := flag.Bool("stats", false, "print profile/conversion statistics to stderr")
 	unmatchedPath := flag.String("unmatched", "", "optional path to write profile function names not found in binary symbols")
 	flag.Parse()
 
@@ -45,6 +57,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	weightIndex := chooseWeightIndex(p)
 
 	symbols := map[string]bool(nil)
 	if *binaryPath != "" {
@@ -54,17 +67,22 @@ func main() {
 		}
 	}
 
+	var st stats
 	weights := map[string]int64{}
 	for _, s := range p.Sample {
-		w := sampleWeight(s.Value)
+		st.Samples++
+		w := sampleWeight(s.Value, weightIndex)
 		if w == 0 {
+			st.SamplesZero++
 			continue
 		}
 		if *mode == "flat" {
 			name := leafFunction(s)
-			if name != "" {
-				weights[name] += w
+			if name == "" {
+				st.SamplesNoName++
+				continue
 			}
+			weights[name] += w
 			continue
 		}
 
@@ -82,16 +100,26 @@ func main() {
 				weights[name] += w
 			}
 		}
+		if len(seen) == 0 {
+			st.SamplesNoName++
+		}
 	}
+	st.FunctionsSeen = len(weights)
 
 	var unmatched []entry
 	var entries []entry
 	for name, weight := range weights {
-		if weight < *minWeight || (!*keepRuntime && isRuntimeName(name)) {
+		if weight < *minWeight {
+			st.DroppedMinWeight++
+			continue
+		}
+		if !*keepRuntime && isRuntimeName(name) {
+			st.DroppedRuntime++
 			continue
 		}
 		matched := matchSymbol(name, symbols)
 		if matched == "" {
+			st.DroppedUnmatched++
 			if symbols != nil {
 				unmatched = append(unmatched, entry{Name: name, Weight: weight})
 			}
@@ -109,20 +137,40 @@ func main() {
 	for _, e := range entries {
 		fmt.Println(e.Name)
 	}
+	st.Emitted = len(entries)
 
 	if *unmatchedPath != "" {
 		if err := writeUnmatched(*unmatchedPath, unmatched); err != nil {
 			log.Fatal(err)
 		}
 	}
+
+	if *showStats || st.Emitted == 0 {
+		printStats(os.Stderr, p, weightIndex, symbols, st, *keepRuntime)
+	}
 }
 
-func sampleWeight(v []int64) int64 {
+func chooseWeightIndex(p *profile.Profile) int {
+	// CPU profiles commonly have both "samples/count" and "cpu/nanoseconds".
+	// Prefer CPU time when present; otherwise fall back to the first sample value.
+	for i, st := range p.SampleType {
+		if st == nil {
+			continue
+		}
+		if st.Type == "cpu" || st.Unit == "nanoseconds" {
+			return i
+		}
+	}
+	return 0
+}
+
+func sampleWeight(v []int64, idx int) int64 {
 	if len(v) == 0 {
 		return 1
 	}
-	// For CPU profiles this is normally sample count or nanoseconds depending on
-	// profile/sample type. For ordering, either is usable as a relative weight.
+	if idx >= 0 && idx < len(v) {
+		return v[idx]
+	}
 	return v[0]
 }
 
@@ -209,4 +257,39 @@ func writeUnmatched(path string, entries []entry) error {
 		fmt.Fprintf(f, "%d %s\n", e.Weight, e.Name)
 	}
 	return nil
+}
+
+func printStats(w io.Writer, p *profile.Profile, weightIndex int, symbols map[string]bool, st stats, keepRuntime bool) {
+	fmt.Fprintln(w, "pprof2textorder stats:")
+	fmt.Fprintf(w, "  sample_types:")
+	for i, t := range p.SampleType {
+		if t == nil {
+			continue
+		}
+		marker := ""
+		if i == weightIndex {
+			marker = "*"
+		}
+		fmt.Fprintf(w, " %s%d:%s/%s", marker, i, t.Type, t.Unit)
+	}
+	fmt.Fprintln(w)
+	fmt.Fprintf(w, "  samples: %d\n", st.Samples)
+	fmt.Fprintf(w, "  samples_zero_weight: %d\n", st.SamplesZero)
+	fmt.Fprintf(w, "  samples_without_function_name: %d\n", st.SamplesNoName)
+	fmt.Fprintf(w, "  functions_seen: %d\n", st.FunctionsSeen)
+	fmt.Fprintf(w, "  dropped_min_weight: %d\n", st.DroppedMinWeight)
+	fmt.Fprintf(w, "  dropped_runtime: %d (keep-runtime=%v)\n", st.DroppedRuntime, keepRuntime)
+	fmt.Fprintf(w, "  dropped_unmatched: %d\n", st.DroppedUnmatched)
+	if symbols != nil {
+		fmt.Fprintf(w, "  binary_text_symbols: %d\n", len(symbols))
+	} else {
+		fmt.Fprintln(w, "  binary_text_symbols: not used")
+	}
+	fmt.Fprintf(w, "  emitted: %d\n", st.Emitted)
+	if st.Emitted == 0 {
+		fmt.Fprintln(w, "  hint: if dropped_runtime is high, retry with -keep-runtime")
+		fmt.Fprintln(w, "  hint: if samples is 0, collect a longer/active CPU profile")
+		fmt.Fprintln(w, "  hint: if samples_without_function_name is high, pass -binary /path/to/unstripped-binary or inspect with go tool pprof")
+		fmt.Fprintln(w, "  hint: if dropped_unmatched is high, pass the exact binary used to collect the profile and check -unmatched")
+	}
 }
